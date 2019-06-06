@@ -138,9 +138,8 @@ pub fn run_fft_and_output_stage(
     let mut writer = Writer::new();
     let mut total_samples = 0u64;
     for window in fft_chain {
-        for (frequency_correct, destination, time_log) in output_chains.iter_mut() {
+        for (_frequency_correct, destination, time_log) in output_chains.iter_mut() {
             let mut output_window = window.clone();
-            frequency_correct.correct_samples(output_window.samples_mut());
             // time_log borrowing
             let time_log: Option<&mut (dyn Write + Send)> = match time_log {
                 Some(time_log) => Some(&mut *time_log),
