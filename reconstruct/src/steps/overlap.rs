@@ -98,6 +98,11 @@ where
                             .second_half_mut()
                             .copy_from_slice(new_window.first_half());
                     }
+                    // Debugging only: Set the last sample before the gap to i + 1
+                    if let Some(last_sample) = prev_window.first_half_mut().last_mut() {
+                        last_sample.re = 1.0;
+                        last_sample.im = 1.0;
+                    };
 
                     // Store new window
                     self.prev_window = Some(new_window);

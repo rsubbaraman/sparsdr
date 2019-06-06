@@ -427,6 +427,12 @@ impl TimeWindow {
         &mut self.samples
     }
 
+    /// Returns a mutable reference to the samples in the first half of this window
+    pub fn first_half_mut(&mut self) -> &mut [Complex32] {
+        let len = self.len();
+        &mut self.samples[..len / 2]
+    }
+
     /// Returns a mutable reference to the samples in the second half of this window
     pub fn second_half_mut(&mut self) -> &mut [Complex32] {
         let len = self.len();
