@@ -21,6 +21,9 @@ use std::cmp;
 use std::iter::Fuse;
 
 use crate::window::{Status, TimeWindow};
+use num_complex::Complex32;
+use num_traits::Zero;
+use std::num::NonZeroU64;
 
 /// Modifies the second half of the first window by adding to each element the corresponding
 /// value from the first half of the second window
@@ -44,7 +47,8 @@ fn overlap_windows(first: &mut TimeWindow, second: &TimeWindow) {
 
 /// An iterator adapter that overlaps windows
 ///
-/// This implementation does not include gaps between samples.
+/// This implementation includes gaps between samples. Due to timestamp overflow, gaps longer than
+/// about 10 seconds cannot be represented.
 pub struct Overlap<I> {
     /// Inner iterator
     inner: Fuse<I>,
@@ -52,6 +56,8 @@ pub struct Overlap<I> {
     prev_window: Option<TimeWindow>,
     /// Window size, samples
     window_size: usize,
+    /// The number of half-window-size windows of zeros that still need to be produced
+    zero_windows: Option<NonZeroU64>,
 }
 
 impl<I> Overlap<I>
@@ -64,6 +70,7 @@ where
             inner: inner.fuse(),
             prev_window: None,
             window_size,
+            zero_windows: None,
         }
     }
 
@@ -83,6 +90,27 @@ where
                     Some(prev_window.into_second_half())
                 }
                 _ => {
+                    // Visualization:
+                    // Difference 0 (shouldn't happen):
+                    // [--------t--------]
+                    // [--------t--------]
+                    // Difference 1: Overlap
+                    // [--------t--------]
+                    //          [--------t+1------]
+                    // Difference 2: Adjacent
+                    // [--------t--------]
+                    //                    [--------t+2------]
+                    // Difference 3: Half-window gap
+                    // [--------t--------]
+                    //                              [--------t+3------]
+
+                    // Gap between windows (number of half-windows) = time_difference - 2
+                    if time_difference > 2 {
+                        self.zero_windows = Some(NonZeroU64::new(time_difference - 2).unwrap());
+                    } else {
+                        self.zero_windows = None;
+                    }
+
                     // Don't overlap, just send second half of previous window followed by
                     // first half of new window
 
@@ -108,8 +136,7 @@ where
             }
         } else {
             // Send out the first half of the new window and store the rest
-            let first_half =
-                TimeWindow::new(new_window.time(), new_window.first_half().to_vec());
+            let first_half = TimeWindow::new(new_window.time(), new_window.first_half().to_vec());
             self.prev_window = Some(new_window);
             Some(first_half)
         }
@@ -133,21 +160,35 @@ where
     type Item = TimeWindow;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.inner.next() {
-                Some(Status::Ok(new_window)) => {
-                    assert_eq!(new_window.len(), self.window_size, "Incorrect window size");
-                    return self.handle_window(new_window);
-                }
-                Some(Status::Timeout) => {
-                    if let Some(prev) = self.prev_window.take() {
-                        // Send the second half of the window
-                        return Some(prev.into_second_half());
-                    } else {
-                        // Continue waiting for something to happen
+        if let Some(zero_windows) = self.zero_windows {
+            // Produce more half-length windows of zero
+            // The window time value isn't actually used after this step, so it doesn't matter.
+            let window_time = self.prev_window.as_ref().map(TimeWindow::time).unwrap_or(0);
+
+            // Decrement remaining windows to produce
+            self.zero_windows = NonZeroU64::new(zero_windows.get() - 1);
+            Some(TimeWindow::new(
+                window_time,
+                vec![Complex32::zero(); self.window_size / 2],
+            ))
+        } else {
+            // Get the next window from the inner iterator
+            loop {
+                match self.inner.next() {
+                    Some(Status::Ok(new_window)) => {
+                        assert_eq!(new_window.len(), self.window_size, "Incorrect window size");
+                        return self.handle_window(new_window);
                     }
+                    Some(Status::Timeout) => {
+                        if let Some(prev) = self.prev_window.take() {
+                            // Send the second half of the window
+                            return Some(prev.into_second_half());
+                        } else {
+                            // Continue waiting for something to happen
+                        }
+                    }
+                    None => return self.handle_end(),
                 }
-                None => return self.handle_end(),
             }
         }
     }
