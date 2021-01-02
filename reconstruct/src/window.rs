@@ -457,6 +457,11 @@ impl TimeWindow {
     pub fn tag(&self) -> Option<&Tag> {
         self.tag.as_ref()
     }
+
+    /// Consumes this window and returns its samples
+    pub fn into_samples(self) -> Vec<Complex32> {
+        self.samples
+    }
 }
 
 /// Converts a time-domain window into an iterator over its samples
