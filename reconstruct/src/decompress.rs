@@ -20,7 +20,7 @@
 //!
 
 use std::collections::BTreeMap;
-use std::io::{Error, ErrorKind, Result, Write};
+use std::io::{Error, ErrorKind, Result};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,42 +29,46 @@ use crossbeam::thread::{self, ScopedJoinHandle};
 
 use crate::band_decompress::BandSetup;
 use crate::bins::BinRange;
-use crate::blocking::{BlockLogger, BlockLogs};
+use crate::blocking::BlockLogs;
 use crate::component_setup::set_up_stages_combined;
-use crate::input::Sample;
 use crate::stages::fft_and_output::{run_fft_and_output_stage, FftOutputReport};
-use crate::stages::input::{run_input_stage, InputReport};
+use crate::stages::input::run_input_stage;
+use crate::stages::input::InputReport;
+use crate::steps::overlap::OverlapMode;
+use crate::window::Window;
 
 /// Default channel capacity value
 const DEFAULT_CHANNEL_CAPACITY: usize = 0;
 
 /// Setup for decompression
-pub struct DecompressSetup<'w, 'b, I> {
+pub struct DecompressSetup<'w, I> {
     /// Compressed sample source
     source: I,
     /// Bands to decompress
     bands: Vec<BandSetup<'w>>,
+    /// Number of bins in the FFT used for compression
+    compression_fft_size: usize,
+    /// The number of bits in the window timestamp counter
+    timestamp_bits: u32,
     /// Capacity of input -> FFT/output stage channels
     channel_capacity: usize,
-    /// Block logger used in source
-    source_block_logger: Option<&'b BlockLogger>,
-    /// A file or file-like thing where the time when each channel becomes active will be written
-    input_time_log: Option<Box<dyn Write>>,
+    overlap_mode: OverlapMode,
     /// Stop flag, used to stop compression before the end of the input file
     ///
     /// When this is set to true, all decompression threads will cleanly exit
     stop: Option<Arc<AtomicBool>>,
 }
 
-impl<'w, 'b, I> DecompressSetup<'w, 'b, I> {
+impl<'w, I> DecompressSetup<'w, I> {
     /// Creates a new decompression setup with no bands and default channel capacity
-    pub fn new(source: I) -> Self {
+    pub fn new(source: I, compression_fft_size: usize, timestamp_bits: u32) -> Self {
         DecompressSetup {
             source,
             bands: Vec::new(),
+            compression_fft_size,
+            timestamp_bits,
+            overlap_mode: OverlapMode::Flush(0),
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
-            source_block_logger: None,
-            input_time_log: None,
             stop: None,
         }
     }
@@ -72,20 +76,6 @@ impl<'w, 'b, I> DecompressSetup<'w, 'b, I> {
     /// Sets the capacity of input -> FFT/output stage channels
     pub fn set_channel_capacity(&mut self, channel_capacity: usize) -> &mut Self {
         self.channel_capacity = channel_capacity;
-        self
-    }
-
-    /// Sets the block logger used for input
-    ///
-    /// This should be the same logger provided to the sample source.
-    pub fn set_source_block_logger(&mut self, logger: &'b BlockLogger) -> &mut Self {
-        self.source_block_logger = Some(logger);
-        self
-    }
-
-    /// Sets the input active channel time log
-    pub fn set_input_time_log(&mut self, log: Box<dyn Write>) -> &mut Self {
-        self.input_time_log = Some(log);
         self
     }
 
@@ -101,19 +91,27 @@ impl<'w, 'b, I> DecompressSetup<'w, 'b, I> {
         self.bands.push(band);
         self
     }
+
+    /// Sets the overlap/flush mode
+    pub fn set_overlap_mode(&mut self, overlap_mode: OverlapMode) -> &mut Self {
+        self.overlap_mode = overlap_mode;
+        self
+    }
 }
 
 /// Decompresses bands using the provided setup and returns information about the decompression
-pub fn decompress<I>(setup: DecompressSetup<'_, '_, I>) -> Result<Report>
+pub fn decompress<I>(setup: DecompressSetup<'_, I>) -> Result<Report>
 where
-    I: IntoIterator<Item = Result<Sample>>,
+    I: IntoIterator<Item = Result<Window>>,
 {
     // Figure out the stages
     let stages = set_up_stages_combined(
         setup.source,
         setup.bands,
+        setup.compression_fft_size,
+        setup.timestamp_bits,
         setup.channel_capacity,
-        setup.input_time_log,
+        setup.overlap_mode,
     );
 
     // Measure time
@@ -128,6 +126,8 @@ where
     let (input_report, fft_output_reports): (InputReport, BTreeMap<BinRange, FftOutputReport>) =
         thread::scope(|scope| {
             // Start a thread for each FFT and output stage
+            // The threads all need to be started here before running the input stage.
+            #[allow(clippy::needless_collect)]
             let fft_and_output_threads: Vec<(
                 BinRange,
                 ScopedJoinHandle<'_, Result<FftOutputReport>>,
@@ -194,13 +194,7 @@ where
     let end_time = Instant::now();
     let run_time = end_time.duration_since(start_time);
 
-    let report = assemble_report(
-        input_report,
-        setup.source_block_logger.map(BlockLogger::logs),
-        fft_output_reports,
-        threads,
-        run_time,
-    );
+    let report = assemble_report(input_report, fft_output_reports, threads, run_time);
 
     Ok(report)
 }
@@ -212,8 +206,6 @@ pub struct Report {
     samples: u64,
     /// Total decompression time
     run_time: Duration,
-    /// Input source read blocking
-    input_blocks: Option<BlockLogs>,
     /// FFT reports
     ffts: BTreeMap<BinRange, FftReport>,
     /// Total threads created
@@ -238,7 +230,6 @@ struct FftReport {
 /// Creates a decompression report
 fn assemble_report(
     input: InputReport,
-    input_blocks: Option<BlockLogs>,
     mut fft_outputs: BTreeMap<BinRange, FftOutputReport>,
     threads: usize,
     run_time: Duration,
@@ -263,7 +254,6 @@ fn assemble_report(
     Report {
         samples,
         run_time,
-        input_blocks,
         ffts,
         threads,
         _0: (),

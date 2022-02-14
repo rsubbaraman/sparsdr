@@ -31,10 +31,10 @@ fn test_empty() {
     let empty_source = iter::empty();
     let mut destination = Vec::new();
     {
-        let band_setup = BandSetupBuilder::new(Box::new(&mut destination))
+        let band_setup = BandSetupBuilder::new(Box::new(&mut destination), 100e6, 2048, 2048, 2048)
             .bins(2048)
             .center_frequency(0.0);
-        let mut setup = DecompressSetup::new(empty_source);
+        let mut setup = DecompressSetup::new(empty_source, 2048, 20);
         setup.add_band(band_setup.build());
         decompress(setup).expect("Decompress failed");
     }
@@ -61,7 +61,7 @@ fn test_fewer_bins_on_center() {
         "test-data/fewer-centered/x_istft_f_testvectors_0fc-32",
         "test-data/fewer-centered/decompressed.iq",
         0.0,
-        46,
+        64,
     );
 }
 
@@ -76,7 +76,7 @@ fn test_bin_frequency_offset() {
         "test-data/bin-frequency-offset/x_istft_f_testvectors_0fc-32",
         "test-data/bin-frequency-offset/decompressed.iq",
         64.5 * 100e6 / 2048.0,
-        48,
+        64,
     );
 }
 
@@ -90,7 +90,7 @@ fn test_non_bin_frequency_offset() {
         "test-data/non-bin-frequency-offset/x_istft_f_testvectors_0fc-32",
         "test-data/non-bin-frequency-offset/decompressed.iq",
         64.0 * 100e6 / 2048.0,
-        46,
+        64,
     );
 }
 
@@ -101,7 +101,7 @@ fn test_large_offset() {
         "test-data/500p5/x_istft_f_testvectors_0fc-32",
         "test-data/500p5/decompressed.iq",
         500.5 * 100e6 / 2048.0,
-        46,
+        64,
     );
 }
 
@@ -112,6 +112,6 @@ fn test_random_offset() {
         "test-data/random-offset/x_istft_f_testvectors_0fc-32",
         "test-data/random-offset/decompressed.iq",
         100e6 / 5.0,
-        46,
+        64,
     );
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 The Regents of the University of California
+ * Copyright 2019-2022 The Regents of the University of California
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,231 +17,86 @@
 
 //! The overlap step
 
-use std::cmp;
-use std::iter::Fuse;
+use crate::steps::overlap::overlap_flush::OverlapFlush;
+use crate::steps::overlap::overlap_gaps::OverlapGaps;
+use crate::window::Status;
+use crate::window::TimeWindow;
 
-use crate::window::{Status, TimeWindow};
+mod overlap_flush;
+mod overlap_gaps;
 
-/// Modifies the second half of the first window by adding to each element the corresponding
-/// value from the first half of the second window
-fn overlap_windows(first: &mut TimeWindow, second: &TimeWindow) {
-    let first_second_half = first.second_half_mut();
-    let second_first_half = second.first_half();
-    // If the slice lengths are not the same, copy over a shorter range
-    // Align to the end of first_second_half and the beginning of second_first_half
-    let copy_length = cmp::min(first_second_half.len(), second_first_half.len());
-
-    let first_exclude = first_second_half.len() - copy_length;
-    let first_second_half = &mut first_second_half[first_exclude..];
-
-    let second_first_half = &second_first_half[..copy_length];
-
-    assert_eq!(first_second_half.len(), second_first_half.len());
-    for (first, second) in first_second_half.iter_mut().zip(second_first_half.iter()) {
-        *first += *second;
-    }
-}
-
-/// An iterator adapter that overlaps windows
-///
-/// This implementation does not include gaps between samples.
+/// An overlap step that may either insert gaps or support flushing
 pub struct Overlap<I> {
-    /// Inner iterator
-    inner: Fuse<I>,
-    /// Previous window, of which half has been written
-    prev_window: Option<TimeWindow>,
-    /// Window size, samples
-    window_size: usize,
+    implementation: OverlapImpl<I>,
 }
 
 impl<I> Overlap<I>
 where
     I: Iterator<Item = Status<TimeWindow>>,
 {
-    /// Creates an overlap iterator for the provided window size
-    pub fn new(inner: I, window_size: usize) -> Self {
+    /// Creates a new overlap step that puts zero samples in the gaps between periods with active
+    /// signals
+    pub fn new_gaps(inner: I, window_size: usize) -> Self {
         Overlap {
-            inner: inner.fuse(),
-            prev_window: None,
-            window_size,
+            implementation: OverlapImpl::Gaps(OverlapGaps::new(inner, window_size)),
         }
     }
 
-    fn handle_window(&mut self, new_window: TimeWindow) -> Option<TimeWindow> {
-        if let Some(mut prev_window) = self.prev_window.take() {
-            assert!(
-                new_window.time() > prev_window.time(),
-                "New window is not after previous window"
-            );
-            let time_difference = new_window.time() - prev_window.time();
-            match time_difference {
-                1 => {
-                    // Overlap
-                    overlap_windows(&mut prev_window, &new_window);
-                    self.prev_window = Some(new_window);
-                    // Send second half of previous window
-                    Some(prev_window.into_second_half())
-                }
-                _ => {
-                    // Don't overlap, just send second half of previous window followed by
-                    // first half of new window
-
-                    // Copy second half of previous window into first half
-                    {
-                        let (prev_first, prev_second) = prev_window.halves_mut();
-                        prev_first.copy_from_slice(prev_second);
-                    }
-
-                    // Copy first half of new window into second half of previous window
-                    {
-                        prev_window
-                            .second_half_mut()
-                            .copy_from_slice(new_window.first_half());
-                    }
-
-                    // Store new window
-                    self.prev_window = Some(new_window);
-
-                    // Send previous window
-                    Some(prev_window)
-                }
-            }
-        } else {
-            // Send out the first half of the new window and store the rest
-            let first_half =
-                TimeWindow::new(new_window.time(), new_window.first_half().to_vec());
-            self.prev_window = Some(new_window);
-            Some(first_half)
+    /// Creates a new overlap step that produces flushed windows
+    pub fn new_flush(inner: I, window_size: usize) -> Self {
+        Overlap {
+            implementation: OverlapImpl::Flush(OverlapFlush::new(inner, window_size)),
         }
     }
+}
 
-    fn handle_end(&mut self) -> Option<TimeWindow> {
-        if let Some(prev) = self.prev_window.take() {
-            // Need to send the second half of the previous window
-            Some(prev.into_second_half())
-        } else {
-            // The end
-            None
-        }
-    }
+enum OverlapImpl<I> {
+    Gaps(OverlapGaps<I>),
+    Flush(OverlapFlush<I>),
 }
 
 impl<I> Iterator for Overlap<I>
 where
     I: Iterator<Item = Status<TimeWindow>>,
 {
-    type Item = TimeWindow;
+    type Item = FlushWindow;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.inner.next() {
-                Some(Status::Ok(new_window)) => {
-                    assert_eq!(new_window.len(), self.window_size, "Incorrect window size");
-                    return self.handle_window(new_window);
-                }
-                Some(Status::Timeout) => {
-                    if let Some(prev) = self.prev_window.take() {
-                        // Send the second half of the window
-                        return Some(prev.into_second_half());
-                    } else {
-                        // Continue waiting for something to happen
-                    }
-                }
-                None => return self.handle_end(),
-            }
+        match &mut self.implementation {
+            OverlapImpl::Gaps(inner) => inner.next(),
+            OverlapImpl::Flush(inner) => inner.next(),
         }
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    use num_complex::Complex32;
-    use std::iter;
-
-    #[test]
-    fn test_one_window() {
-        let samples = vec![
-            Complex32::new(1.0, 2.0),
-            Complex32::new(0.2, 0.05),
-            Complex32::new(127.0, 6.21),
-            Complex32::new(-0.3, -9.2),
-        ];
-        let windows = iter::once(TimeWindow::new(0, samples.clone()));
-        check_iter(4, windows.into_iter().map(Status::Ok), &samples);
+/// A time window that may have been flushed due to a timeout status
+#[derive(Debug, Clone)]
+pub struct FlushWindow {
+    /// The window of samples
+    pub window: TimeWindow,
+    /// True if this window was flushed due to a timeout
+    pub flushed: bool,
+}
+impl FlushWindow {
+    fn not_flushed(window: TimeWindow) -> Self {
+        FlushWindow {
+            window,
+            flushed: false,
+        }
     }
-
-    #[test]
-    fn test_two_windows_no_gap() {
-        let samples1 = vec![
-            Complex32::new(1.0, 2.0),
-            Complex32::new(0.2, 0.05),
-            Complex32::new(127.0, 6.21),
-            Complex32::new(-0.3, -9.2),
-        ];
-
-        let samples2 = vec![
-            Complex32::new(5.0, 6.0),
-            Complex32::new(3.2, 127.05),
-            Complex32::new(6.0, 9.26),
-            Complex32::new(-2.3, -16.2),
-        ];
-        // Middle two samples overlap
-        let expected_samples = vec![
-            Complex32::new(1.0, 2.0),
-            Complex32::new(0.2, 0.05),
-            Complex32::new(127.0 + 5.0, 6.21 + 6.0),
-            Complex32::new(-0.3 + 3.2, -9.2 + 127.05),
-            Complex32::new(6.0, 9.26),
-            Complex32::new(-2.3, -16.2),
-        ];
-
-        let windows = vec![TimeWindow::new(0, samples1), TimeWindow::new(1, samples2)];
-        check_iter(4, windows.into_iter().map(Status::Ok), &expected_samples);
+    fn flushed(window: TimeWindow) -> Self {
+        FlushWindow {
+            window,
+            flushed: true,
+        }
     }
+}
 
-    #[test]
-    fn test_two_windows_timeout() {
-        let samples1 = vec![
-            Complex32::new(1.0, 2.0),
-            Complex32::new(0.2, 0.05),
-            Complex32::new(127.0, 6.21),
-            Complex32::new(-0.3, -9.2),
-        ];
-
-        let samples2 = vec![
-            Complex32::new(5.0, 6.0),
-            Complex32::new(3.2, 127.05),
-            Complex32::new(6.0, 9.26),
-            Complex32::new(-2.3, -16.2),
-        ];
-        // No overlap because of timeout
-        let expected_samples = vec![
-            Complex32::new(1.0, 2.0),
-            Complex32::new(0.2, 0.05),
-            Complex32::new(127.0, 6.21),
-            Complex32::new(-0.3, -9.2),
-            Complex32::new(5.0, 6.0),
-            Complex32::new(3.2, 127.05),
-            Complex32::new(6.0, 9.26),
-            Complex32::new(-2.3, -16.2),
-        ];
-
-        let windows = vec![
-            Status::Ok(TimeWindow::new(0, samples1)),
-            Status::Timeout,
-            Status::Ok(TimeWindow::new(1, samples2)),
-        ];
-        check_iter(4, windows, &expected_samples);
-    }
-
-    fn check_iter<I>(window_size: usize, windows: I, expected: &[Complex32])
-    where
-        I: IntoIterator<Item = Status<TimeWindow>>,
-    {
-        let overlap = Overlap::new(windows.into_iter(), window_size);
-        let result = overlap.flatten().collect::<Vec<Complex32>>();
-        assert_eq!(&*result, expected);
-    }
+/// A mode for the overlap steps
+#[derive(Debug, Clone)]
+pub enum OverlapMode {
+    /// Put zero samples in gaps
+    Gaps,
+    /// Flush samples (the enclosed value is the number of samples to insert)
+    Flush(u32),
 }

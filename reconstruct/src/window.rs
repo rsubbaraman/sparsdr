@@ -24,14 +24,9 @@ use std::iter::Enumerate;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::slice::Iter;
-use std::u16;
 
 use num_complex::Complex32;
 use num_traits::Zero;
-use sparsdr_bin_mask::BinMask;
-
-#[cfg(test)]
-use super::input::Sample;
 
 use super::bins::BinRange;
 
@@ -89,8 +84,6 @@ pub struct Window<Ord = Fft> {
     ///
     /// Each value is a complex amplitude (in frequency domain)
     bins: Vec<Complex32>,
-    /// A mask of bins that are active
-    active_bins: BinMask,
     /// An optional window tag
     tag: Option<Tag>,
     /// Order phantom
@@ -114,7 +107,6 @@ impl Window<Fft> {
         Window {
             time,
             bins: vec![Complex32::zero(); size],
-            active_bins: BinMask::zero(),
             tag: None,
             _order_phantom: PhantomData,
         }
@@ -127,7 +119,6 @@ impl Window<Logical> {
         Window {
             time,
             bins: vec![Complex32::zero(); size],
-            active_bins: BinMask::zero(),
             tag: None,
             _order_phantom: PhantomData,
         }
@@ -149,68 +140,45 @@ impl<Ord> Window<Ord>
 where
     Ord: Ordering,
 {
-    /// Creates a window from an iterator of samples
-    ///
-    /// time: The time of this window
-    ///
-    /// size: The size of this window
-    ///
-    /// samples: An iterator that yields samples
-    ///
-    /// The returned window will contain amplitude values from the samples iterator.
+    /// Creates a window with the provided time, size and bins
     ///
     /// # Panics
     ///
-    /// This function will panic if any sample from samples has an index greater than or equal to
-    /// size.
-    ///
-    #[cfg(test)]
-    pub(crate) fn with_samples<I>(time: u64, size: usize, samples: I) -> Self
+    /// This function panics if size is greater than
+    pub fn with_bins<I>(time: u64, size: usize, bins: I) -> Self
     where
-        I: IntoIterator<Item = Sample>,
+        I: IntoIterator<Item = Complex32>,
     {
-        let mut bins = vec![Complex32::zero(); size];
-        let mut active_bins = BinMask::zero();
-
-        for sample in samples {
-            bins[usize::from(sample.index)] = sample.amplitude;
-            if !sample.amplitude.is_zero() {
-                active_bins.set(usize::from(sample.index), true);
-            }
-        }
-
+        let mut collected_bins: Vec<Complex32> = bins.into_iter().collect();
+        collected_bins.resize(size, Complex32::zero());
         Window {
             time,
-            bins,
-            active_bins,
+            bins: collected_bins,
             tag: None,
-            _order_phantom: PhantomData,
+            _order_phantom: Default::default(),
         }
     }
 
     /// Returns the timestamp of this window
+    #[inline]
     pub fn time(&self) -> u64 {
         self.time
     }
+    /// Sets the timestamp of this window
+    pub fn set_time(&mut self, time: u64) {
+        self.time = time;
+    }
 
     /// Returns a reference to the bins
+    #[inline]
     pub fn bins(&self) -> &[Complex32] {
         &self.bins
     }
 
     /// Returns a mutable reference to the bins
+    #[inline]
     pub fn bins_mut(&mut self) -> &mut [Complex32] {
         &mut self.bins
-    }
-
-    /// Returns a reference to the mask of active bins
-    pub fn active_bins(&self) -> &BinMask {
-        &self.active_bins
-    }
-
-    /// Returns a mutable reference to the mask of active bins
-    pub fn active_bins_mut(&mut self) -> &mut BinMask {
-        &mut self.active_bins
     }
 
     /// Sets the amplitude in a bin
@@ -278,7 +246,6 @@ where
         Window {
             time: self.time,
             bins: self.bins,
-            active_bins: self.active_bins,
             tag: self.tag,
             _order_phantom: PhantomData,
         }
@@ -412,6 +379,11 @@ impl TimeWindow {
         self.samples.len()
     }
 
+    /// Returns true if this window does not contain any samples
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
     /// Returns a reference to the samples in this window
     pub fn samples(&self) -> &[Complex32] {
         &self.samples
@@ -457,6 +429,11 @@ impl TimeWindow {
     pub fn tag(&self) -> Option<&Tag> {
         self.tag.as_ref()
     }
+
+    /// Consumes this window and returns its samples
+    pub fn into_samples(self) -> Vec<Complex32> {
+        self.samples
+    }
 }
 
 /// Converts a time-domain window into an iterator over its samples
@@ -479,6 +456,21 @@ pub enum Status<T> {
     /// This indicates that later steps should flush any buffered data instead of waiting
     /// for more compressed samples
     Timeout,
+    /// Every FFT and output stage gets this, which contains the timestamp of the first window
+    /// of samples read from the file. The overlap step uses this to insert zeros before the
+    /// first reconstructed time window.
+    ///
+    /// The timestamp is in half-windows (1024 samples at 100 MHz sample rate for the USRP N210)
+    FirstWindowTime(u64),
+}
+
+/// A window, or the timestamp of the first window
+#[derive(Debug)]
+pub enum WindowOrTimestamp {
+    /// A window
+    Window(Window<Logical>),
+    /// The timestamp of the first window
+    FirstWindowTimestamp(u64),
 }
 
 #[cfg(test)]

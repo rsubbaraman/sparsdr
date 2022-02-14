@@ -46,6 +46,7 @@
 //! frequency correction and writes samples to the destination.
 //!
 
+use crate::steps::overlap::OverlapMode;
 use std::io::{Result, Write};
 use std::iter;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,21 +59,25 @@ use crate::channel_ext::LoggingReceiver;
 use crate::iter_ext::IterExt;
 use crate::steps::frequency_correct::FrequencyCorrect;
 use crate::steps::writer::Writer;
-use crate::window::{Logical, Window};
+use crate::window::WindowOrTimestamp;
 
 use super::band_receive::BandReceiver;
 
 pub struct FftAndOutputSetup<'w> {
     /// Source of windows
-    pub source: LoggingReceiver<Window<Logical>>,
+    pub source: LoggingReceiver<WindowOrTimestamp>,
     /// The bins to decompress
     pub bins: BinRange,
+    /// The FFT size used for compression
+    pub compression_fft_size: usize,
     /// The actual FFT size to use
     pub fft_size: u16,
     /// Floor of the center frequency offset, in bins
     pub fc_bins: f32,
     /// Time to wait for a compressed sample before flushing output
     pub timeout: Duration,
+    /// Overlap mode (gaps or flush samples)
+    pub overlap: OverlapMode,
     /// The output setups
     pub outputs: Vec<OutputSetup<'w>>,
 }
@@ -120,8 +125,17 @@ pub fn run_fft_and_output_stage(
         .filter_bins(setup.bins, setup.fft_size)
         .shift(setup.fft_size)
         .phase_correct(setup.fc_bins)
-        .fft(setup.fft_size)
-        .overlap(usize::from(setup.fft_size));
+        .fft(setup.compression_fft_size, setup.fft_size);
+
+    let fft_chain = match setup.overlap {
+        OverlapMode::Gaps => fft_chain.overlap_gaps(usize::from(setup.fft_size)),
+        OverlapMode::Flush(_) => fft_chain.overlap_flush(usize::from(setup.fft_size)),
+    };
+    // Get the number of flush samples to add, or 0 in overlap-gaps mode
+    let flush_samples = match setup.overlap {
+        OverlapMode::Gaps => 0,
+        OverlapMode::Flush(samples) => samples,
+    };
 
     // Set up a frequency corrector for each output
     let mut output_chains = setup
@@ -140,7 +154,7 @@ pub fn run_fft_and_output_stage(
     for window in fft_chain {
         for (frequency_correct, destination, time_log) in output_chains.iter_mut() {
             let mut output_window = window.clone();
-            frequency_correct.correct_samples(output_window.samples_mut());
+            frequency_correct.correct_samples(output_window.window.samples_mut());
             // time_log borrowing
             let time_log: Option<&mut (dyn Write + Send)> = match time_log {
                 Some(time_log) => Some(&mut *time_log),
@@ -150,6 +164,7 @@ pub fn run_fft_and_output_stage(
                 destination,
                 iter::once(output_window),
                 &out_block_logger,
+                flush_samples,
                 time_log,
             )?;
             total_samples = total_samples.saturating_add(samples);

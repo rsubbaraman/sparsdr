@@ -20,11 +20,10 @@
 use std::io::Result;
 
 use crate::bins::BinRange;
-use crate::input::Sample;
 use crate::steps::fft::Fft;
 use crate::steps::filter_bins::FilterBinsIter;
 use crate::steps::frequency_correct::FrequencyCorrectIter;
-use crate::steps::group::Grouper;
+use crate::steps::overflow::OverflowResultIter;
 use crate::steps::overlap::Overlap;
 use crate::steps::phase_correct::PhaseCorrectIter;
 use crate::steps::shift::{ShiftIter, ShiftWindowResultIter};
@@ -33,14 +32,6 @@ use super::window::{Logical, Status, TimeWindow, Window};
 
 /// Iterator extension for signal processing
 pub trait IterExt {
-    /// Groups samples with the same time field into windows
-    fn group(self, fft_size: usize) -> Grouper<Self>
-    where
-        Self: Iterator<Item = Result<Sample>> + Sized,
-    {
-        Grouper::new(self, fft_size)
-    }
-
     /// Filters windows based on a bin range
     ///
     /// bin_range: The range of bins to keep
@@ -78,19 +69,26 @@ pub trait IterExt {
     }
 
     /// Applies an inverse FFT to windows
-    fn fft(self, fft_size: u16) -> Fft<Self>
+    fn fft(self, compression_fft_size: usize, fft_size: u16) -> Fft<Self>
     where
         Self: Iterator<Item = Status<Window>> + Sized,
     {
-        Fft::new(self, usize::from(fft_size))
+        Fft::new(self, compression_fft_size, usize::from(fft_size))
     }
 
     /// Overlaps windows with consecutive time values
-    fn overlap(self, window_size: usize) -> Overlap<Self>
+    fn overlap_gaps(self, window_size: usize) -> Overlap<Self>
     where
         Self: Iterator<Item = Status<TimeWindow>> + Sized,
     {
-        Overlap::new(self, window_size)
+        Overlap::new_gaps(self, window_size)
+    }
+    /// Overlaps windows with consecutive time values
+    fn overlap_flush(self, window_size: usize) -> Overlap<Self>
+    where
+        Self: Iterator<Item = Status<TimeWindow>> + Sized,
+    {
+        Overlap::new_flush(self, window_size)
     }
 
     /// Applies frequency correction to time-domain samples
@@ -99,6 +97,14 @@ pub trait IterExt {
         Self: Iterator<Item = TimeWindow> + Sized,
     {
         FrequencyCorrectIter::new(self, selected_center, fft_size)
+    }
+
+    /// Corrects timestamp overflows
+    fn overflow_correct<Ord>(self, timestamp_bits: u32) -> OverflowResultIter<Self>
+    where
+        Self: Iterator<Item = Result<Window<Ord>>> + Sized,
+    {
+        OverflowResultIter::new(self, timestamp_bits)
     }
 }
 

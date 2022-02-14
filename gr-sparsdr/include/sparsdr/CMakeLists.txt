@@ -22,13 +22,11 @@
 ########################################################################
 install(FILES
     api.h
+    compressing_pluto_source.h
     compressing_usrp_source.h
-    average_detector.h
-    real_time_receiver.h
-    real_time_receiver.h
-    multi_sniffer.h
-    mask_range.h
+    iio_device_source.h
     reconstruct.h
-    average_waterfall.h
-    sample_distributor.h DESTINATION include/sparsdr
+    swap_16.h
+    combined_usrp_receiver.h
+    combined_pluto_receiver.h DESTINATION include/sparsdr
 )

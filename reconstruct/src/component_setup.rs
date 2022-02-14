@@ -18,17 +18,17 @@
 //! Determines a good setup for the stages of decompression
 
 use std::collections::BTreeMap;
-use std::io::{Result, Write};
+use std::io::Result;
 
 use crossbeam::channel;
-use sparsdr_bin_mask::BinMask;
 
 use crate::band_decompress::BandSetup;
 use crate::bins::BinRange;
 use crate::channel_ext::{LoggingReceiver, LoggingSender};
-use crate::input::Sample;
 use crate::stages::fft_and_output::{FftAndOutputSetup, OutputSetup};
 use crate::stages::input::{InputSetup, ToFft};
+use crate::steps::overlap::OverlapMode;
+use crate::window::{Window, WindowOrTimestamp};
 
 /// Setups for the input stage, and the combined FFT and output stages
 pub struct StagesCombined<'w, I> {
@@ -47,16 +47,16 @@ pub struct StagesCombined<'w, I> {
 ///
 /// channel_capacity: the capacity of the channels connecting the input stage to each output stage
 ///
-/// input_time_log: A file or file-like thing where active channels and times will be logged
-///
 pub fn set_up_stages_combined<'w, I, B>(
-    samples: I,
+    windows: I,
     bands: B,
+    compression_fft_size: usize,
+    timestamp_bits: u32,
     channel_capacity: usize,
-    input_time_log: Option<Box<dyn Write>>,
+    overlap_mode: OverlapMode,
 ) -> StagesCombined<'w, I::IntoIter>
 where
-    I: IntoIterator<Item = Result<Sample>>,
+    I: IntoIterator<Item = Result<Window>>,
     B: IntoIterator<Item = BandSetup<'w>>,
 {
     let bands = bands.into_iter();
@@ -64,9 +64,10 @@ where
     let mut ffts: BTreeMap<FftKey, FftAndOutputSetup<'w>> = BTreeMap::new();
 
     let mut input = InputSetup {
-        samples: samples.into_iter(),
+        samples: windows.into_iter(),
+        compression_fft_size,
+        timestamp_bits,
         destinations: Vec::new(),
-        input_time_log,
     };
 
     for band_setup in bands {
@@ -74,20 +75,22 @@ where
         let fft_setup = ffts.entry(key(&band_setup)).or_insert_with(|| {
             // Create a new channel to this FFT stage
             let (tx, rx) = channel::bounded(channel_capacity);
-            let tx = LoggingSender::new(tx);
-            let rx = LoggingReceiver::new(rx);
+            let tx: LoggingSender<WindowOrTimestamp> = LoggingSender::new(tx);
+            let rx: LoggingReceiver<WindowOrTimestamp> = LoggingReceiver::new(rx);
 
+            log::debug!("Band bin range {}", band_setup.bins);
             input.destinations.push(ToFft {
                 bins: band_setup.bins.clone(),
-                bin_mask: bin_range_to_masks(&band_setup.bins),
                 tx,
             });
             FftAndOutputSetup {
                 source: rx,
                 bins: band_setup.bins.clone(),
+                compression_fft_size,
                 fft_size: band_setup.fft_size,
                 fc_bins: band_setup.fc_bins,
                 timeout: band_setup.timeout,
+                overlap: overlap_mode.clone(),
                 outputs: vec![],
             }
         });
@@ -115,11 +118,4 @@ struct FftKey(BinRange, i64);
 /// Creates a key from a band setup
 fn key(band_setup: &BandSetup<'_>) -> FftKey {
     FftKey(band_setup.bins.clone(), band_setup.fc_bins as i64)
-}
-
-/// Creates a bin mask containing the same active bins as a bin range
-fn bin_range_to_masks(bin_range: &BinRange) -> BinMask {
-    let mut mask = BinMask::zero();
-    mask.set_range(bin_range.as_usize_range());
-    mask
 }

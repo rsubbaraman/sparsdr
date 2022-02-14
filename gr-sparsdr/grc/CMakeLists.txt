@@ -20,6 +20,8 @@
 install(FILES
     sparsdr_reconstruct.xml
     sparsdr_compressing_usrp_source.xml
-    sparsdr_average_waterfall.xml
-    sparsdr_sample_distributor.xml DESTINATION share/gnuradio/grc/blocks
+    sparsdr_compressing_pluto_source.xml
+    sparsdr_swap_16.xml
+    sparsdr_combined_usrp_receiver.xml
+    sparsdr_combined_pluto_receiver.xml DESTINATION share/gnuradio/grc/blocks
 )

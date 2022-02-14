@@ -19,39 +19,37 @@
 //! into windows, and shifts them into logical order
 
 use std::collections::BTreeMap;
-use std::io::{Error, ErrorKind, Result, Write};
+use std::convert::TryInto;
+use std::io::{Error, ErrorKind, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use libc::{clock_gettime, timespec};
-use sparsdr_bin_mask::BinMask;
+use num_traits::Zero;
 
 use crate::bins::BinRange;
 use crate::blocking::BlockLogs;
 use crate::channel_ext::LoggingSender;
-use crate::input::Sample;
 use crate::iter_ext::IterExt;
-use crate::window::{Logical, Tag, Window};
-use crate::NATIVE_FFT_SIZE;
+use crate::window::{Logical, Tag, Window, WindowOrTimestamp};
 
 /// The setup for the input stage
 pub struct InputSetup<I> {
     /// An iterator yielding samples from the source
     pub samples: I,
+    /// Number of FFT bins used for compression
+    pub compression_fft_size: usize,
+    /// The number of bits used to store the timestamp of each window
+    pub timestamp_bits: u32,
     /// Send half of channels used to send windows to all FFT stages
     pub destinations: Vec<ToFft>,
-    /// A file or file-like thing where the time when each channel becomes active will be written
-    pub input_time_log: Option<Box<dyn Write>>,
 }
 
 /// Information about an FFT stage, and a channel that can be used to send windows there
 pub struct ToFft {
     /// The range of bins the FFT stage is interested in
     pub bins: BinRange,
-    /// The mask of bins the FFT stage is interested in (same as bins)
-    pub bin_mask: BinMask,
     /// A sender on the channel to the FFT stage
-    pub tx: LoggingSender<Window<Logical>>,
+    pub tx: LoggingSender<WindowOrTimestamp>,
 }
 
 impl ToFft {
@@ -61,8 +59,12 @@ impl ToFft {
     /// it returns true if the window was sent.
     pub fn send_if_interested(&self, window: &Window<Logical>) -> Result<bool> {
         // Check if the stage is interested
-        if window.active_bins().overlaps(&self.bin_mask) {
-            match self.tx.send(window.clone()) {
+        let interested = self
+            .bins
+            .as_usize_range()
+            .any(|index| !window.bins()[index].is_zero());
+        if interested {
+            match self.tx.send(WindowOrTimestamp::Window(window.clone())) {
                 Ok(()) => Ok(true),
                 Err(_) => {
                     // This can happen when using the stop flag if the other thread stops before
@@ -79,17 +81,18 @@ impl ToFft {
             Ok(false)
         }
     }
+
+    pub fn send_first_window_time(&self, time: u64) {
+        self.tx
+            .send(WindowOrTimestamp::FirstWindowTimestamp(time))
+            .expect("Can't send first window time");
+    }
 }
 
-pub fn run_input_stage<I>(mut setup: InputSetup<I>, stop: Arc<AtomicBool>) -> Result<InputReport>
+pub fn run_input_stage<I>(setup: InputSetup<I>, stop: Arc<AtomicBool>) -> Result<InputReport>
 where
-    I: Iterator<Item = Result<Sample>>,
+    I: Iterator<Item = Result<Window>>,
 {
-    // Write time log CSV headers
-    if let Some(log) = setup.input_time_log.as_mut() {
-        writeln!(log, "Channel,Tag,Seconds,Nanoseconds")?;
-    }
-
     // Tag windows that have newly active channels
     let mut next_tag = Tag::default();
 
@@ -98,33 +101,49 @@ where
     let shift = setup
         .samples
         .take_while(|_| !stop.load(Ordering::Relaxed))
-        .group(usize::from(NATIVE_FFT_SIZE))
-        .shift_result(NATIVE_FFT_SIZE);
+        .overflow_correct(setup.timestamp_bits)
+        .shift_result(
+            setup
+                .compression_fft_size
+                .try_into()
+                .expect("FFT size too large"),
+        );
+
+    let mut prev_window_time: Option<u64> = None;
+    let mut first_window = true;
 
     // Process windows
-    // Latency measurement hack: detect when the channel changes from active to inactive
-    let mut prev_active = false;
     for window in shift {
         let mut window = window?;
+
+        if let Some(prev_window_time) = prev_window_time {
+            assert!(
+                window.time() > prev_window_time,
+                "Current window (time {}) is not after previous window (time {})",
+                window.time(),
+                prev_window_time
+            );
+        }
+        prev_window_time = Some(window.time());
+
         // Give this window a tag
         let window_tag = next_tag;
         window.set_tag(window_tag);
         next_tag = next_tag.next();
 
+        if first_window {
+            // Send the timestamp to every FFT stage
+            log::debug!("Sending first window timestamp {}", window.time());
+            for fft_stage in &setup.destinations {
+                fft_stage.send_first_window_time(window.time());
+            }
+            first_window = false;
+        }
+
         // Send to each interested FFT stage
         for fft_stage in setup.destinations.iter() {
             match fft_stage.send_if_interested(&window) {
-                Ok(sent) => {
-                    // Latency measurement hack that works correctly only when there is only one
-                    // band to decompress: Detect when the bins have become inactive and log that
-                    if !sent && prev_active {
-                        if let Some(ref mut log) = setup.input_time_log {
-                            log_inactive_channel(&mut *log, "BLE 37", window_tag)?;
-                        }
-                    }
-
-                    prev_active = sent;
-                }
+                Ok(_sent) => {}
                 Err(_) => {
                     // Other thread could have exited normally due to the stop flag, so just
                     // exit this thread normally
@@ -144,26 +163,6 @@ where
     Ok(InputReport {
         channel_send_blocks,
     })
-}
-
-/// Writes a log entry indicating that a channel with the provided name is active
-fn log_inactive_channel(destination: &mut dyn Write, channel_name: &str, tag: Tag) -> Result<()> {
-    let mut now = timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // Use clock_gettime, which should be the same in C++ and Rust
-    let status = unsafe { clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-    if status != 0 {
-        return Err(Error::last_os_error());
-    }
-    // CSV format: channel, tag, seconds, nanoseconds
-    writeln!(
-        destination,
-        "{},{},{},{}",
-        channel_name, tag, now.tv_sec, now.tv_nsec
-    )?;
-    Ok(())
 }
 
 /// A report on the results of the input stage

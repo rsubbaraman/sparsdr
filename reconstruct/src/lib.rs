@@ -25,17 +25,13 @@
     const_err,
     dead_code,
     improper_ctypes,
-    legacy_directory_ownership,
     non_shorthand_field_patterns,
     no_mangle_generic_items,
     overflowing_literals,
     path_statements,
     patterns_in_fns_without_body,
-    plugin_as_library,
     private_in_public,
-    safe_extern_statics,
     unconditional_recursion,
-    unions_with_drop_fields,
     unused,
     unused_allocation,
     unused_comparisons,
@@ -66,7 +62,7 @@ extern crate log;
 extern crate crossbeam;
 extern crate libc;
 extern crate nix;
-extern crate sparsdr_bin_mask;
+extern crate sparsdr_sample_parser;
 
 /// Converts an Option<Result<T, E>> into T, returning None if the value is None
 /// or Some(Err(e)) if the value is Some(Err(e))
@@ -87,6 +83,9 @@ macro_rules! try_status {
         match $e {
             Some(crate::window::Status::Ok(item)) => item,
             Some(crate::window::Status::Timeout) => return Some(crate::window::Status::Timeout),
+            Some(crate::window::Status::FirstWindowTime(time)) => {
+                return Some(crate::window::Status::FirstWindowTime(time))
+            }
             None => return None,
         }
     };
@@ -100,6 +99,7 @@ pub mod bins;
 pub mod iter_ext;
 pub mod steps;
 pub mod window;
+pub mod window_filter;
 
 // Private modules
 mod band_decompress;
@@ -107,11 +107,6 @@ mod channel_ext;
 mod component_setup;
 mod decompress;
 mod stages;
-
-/// FFT size used during compression
-const NATIVE_FFT_SIZE: u16 = 2048;
-/// Default compressed bandwidth
-const DEFAULT_COMPRESSED_BANDWIDTH: f32 = 100_000_000.0;
 
 pub use crate::band_decompress::{BandSetup, BandSetupBuilder};
 pub use crate::decompress::{decompress, DecompressSetup, Report};

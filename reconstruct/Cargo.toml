@@ -34,26 +34,30 @@ nix = "0.13.0"
 libc = "0.2.51"
 
 [dependencies.num-complex]
-version = "0.2.0"
+version = "0.3.0"
 default-features = false
 
 # Use the system-provided dynamically-linked FFTW to work around GPL
 [dependencies.fftw]
-version = "0.5.1"
+version = "0.7"
 default-features = false
 features = ["system"]
 
-[dependencies.sparsdr_bin_mask]
-path = "sparsdr_bin_mask"
+[dependencies.sparsdr_sample_parser]
+path = "sparsdr_sample_parser"
 
 # Enable debug output for release builds, for profiling
 [profile.release]
 debug = true
 
-# Benchmarking section
+# Benchmarking/example section
 [dev-dependencies]
 criterion = "0.3.3"
 tempfile = "3.0.6"
+image = "0.23.14"
+statrs = "0.15.0"
+regex = "1.5.4"
+matfile = "0.3.1"
 
 [[bench]]
 name = "micro"
